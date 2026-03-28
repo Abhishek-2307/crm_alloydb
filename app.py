@@ -64,7 +64,7 @@ def upload_to_gcs(file_bytes, filename):
 @app.route('/')
 def home():
     """
-    Fetches items and renders the app.html template with the item data.
+    Fetches companies and renders the crm dashboard template.
     """
     if engine is None:
         return jsonify({"error": "Database engine not initialized."}), 500
@@ -72,313 +72,224 @@ def home():
     try:
         with engine.connect() as conn:
             query = text("""
-                SELECT item_id, title, bio, category, image_url 
-                FROM items 
-                WHERE status = 'available'
-                ORDER BY created_at DESC
-                LIMIT 20
+                SELECT company_id, industry, company_size, annual_revenue, contract_status, region 
+                FROM companies 
+                ORDER BY company_id DESC
+                LIMIT 50
             """)
             result = conn.execute(query)
             
-            items = []
+            companies =[]
             for row in result:
-                items.append({
-                    "id": str(row[0]),
-                    "title": row[1],
-                    "bio": row[2],
-                    "category": row[3],
-                    "image_url": row[4]
+                companies.append({
+                    "company_id": str(row[0]),
+                    "industry": row[1],
+                    "company_size": row[2],
+                    "annual_revenue": row[3],
+                    "contract_status": row[4],
+                    "region": row[5]
                 })
             
-            # For SELECT, commit isn't required but keeps the connection handling consistent
             conn.commit()
-            return render_template('app.html', items=items)
+            return render_template('crm.html', companies=companies)
             
     except Exception as e:
-        print(f"Error fetching items: {traceback.format_exc()}")
+        print(f"Error fetching companies: {traceback.format_exc()}")
         return jsonify({
-            "error": "Failed to fetch items", 
-            "details": str(e),
-            "traceback": traceback.format_exc()
+            "error": "Failed to fetch companies", 
+            "details": str(e)
         }), 500
 
-@app.route('/api/items', methods=['GET'])
-def get_items():
+@app.route('/api/companies', methods=['GET'])
+def get_companies():
     """
-    Fetches available items from the database to populate the deck.
-    Standardized to use the same variable-based query execution as list_item.
+    Fetches CRM dataset for API consumption.
     """
     if engine is None:
         return jsonify({"error": "Database engine not initialized."}), 500
     try:
         with engine.connect() as conn:
             query = text("""
-                SELECT item_id, title, bio, category, image_url 
-                FROM items 
-                WHERE status = 'available'
-                ORDER BY created_at DESC
-                LIMIT 20
+                SELECT company_id, industry, company_size, annual_revenue, contract_status, region 
+                FROM companies 
+                LIMIT 50
             """)
             result = conn.execute(query)
             
-            items = []
-            for row in result:
-                items.append({
-                    "id": str(row[0]),
-                    "title": row[1],
-                    "bio": row[2],
-                    "category": row[3],
-                    "image_url": row[4]
-                })
+            companies =[{"company_id": str(r[0]), "industry": r[1], "company_size": r[2], 
+                          "annual_revenue": r[3], "contract_status": r[4], "region": r[5]} for r in result]
             
-            # For SELECT, commit isn't required but keeps the connection handling consistent
             conn.commit()
-            return jsonify(items)
+            return jsonify(companies)
             
     except Exception as e:
-        print(f"Error fetching items: {traceback.format_exc()}")
-        return jsonify({
-            "error": "Failed to fetch items", 
-            "details": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return jsonify({"error": "Failed to fetch companies", "details": str(e)}), 500
 
-@app.route('/api/list-item', methods=['POST'])
-def list_item():
+@app.route('/api/add-company', methods=['POST'])
+def add_company():
     """
-    Handles item listing with provider contact info and detailed error reporting.
+    Handles adding a new B2B company.
+    Takes unstructured 'sales_notes' from an employee and uses Gemini to map it to the CRM schema.
     """
     if engine is None:
         return jsonify({"error": "Database engine not initialized."}), 500
 
-    if 'image' not in request.files:
-        return jsonify({"error": "No image provided"}), 400
-    
-    provider_name = request.form.get('provider_name', 'Anonymous')
-    provider_phone = request.form.get('provider_phone', 'No Phone')
-    item_title = request.form.get('item_title', 'No Title') 
-    image_file = request.files['image']
-    image_bytes = image_file.read()
-
-    try:
-        image_url = upload_to_gcs(image_bytes, image_file.filename)
-    except Exception as e:
-        return jsonify({"error": "GCS Upload Failed", "details": str(e)}), 500
+    sales_notes = request.form.get('sales_notes')
+    if not sales_notes:
+        return jsonify({"error": "No sales notes provided"}), 400
 
     prompt = """
-    You are a witty community manager for NeighborLoop. 
-    Analyze this surplus item and return JSON:
+    You are an intelligent CRM assistant. Analyze the sales rep's notes and extract B2B company details. 
+    Return JSON strictly matching these keys (use "Unknown" if missing):
     {
-        "bio": "First-person witty dating-style profile bio, for the product, not longer than 2 lines",
-        "category": "One-word category",
-        "tags": ["tag1", "tag2"]
+        "industry": "string", "company_size": "string", "annual_revenue": "string",
+        "region": "string", "contract_status": "string (e.g., Lead, Active, Churned)"
     }
     """
     
     try:
+        # Use Gemini to parse unstructured notes into structured CRM data
         response = genai_client.models.generate_content(
             model="gemini-3-flash-preview",
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                prompt
-            ],
+            contents=[sales_notes, prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         profile = json.loads(response.text)
         
-        generated_owner_id = str(uuid.uuid4())
+        # Generate a unique company ID
+        company_id = "COMP-" + str(uuid.uuid4())[:8].upper()
         
         with engine.connect() as conn:
+            # We construct a text block to embed based on key company attributes
             query = text("""
-                INSERT INTO items (owner_id, provider_name, provider_phone, title, bio, category, image_url, status, item_vector)
-                VALUES (:owner, :name, :phone, :title, :bio, :cat, :url, 'available', embedding('text-embedding-005', :title || ' ' || :bio)::vector) 
-                RETURNING item_id
+                INSERT INTO companies (
+                    company_id, industry, company_size, annual_revenue, region, contract_status, company_vector
+                )
+                VALUES (
+                    :cid, :ind, :size, :rev, :reg, :status, 
+                    embedding('text-embedding-005', :ind || ' company in ' || :reg || ' with revenue ' || :rev)::vector
+                ) 
+                RETURNING company_id
             """)
             result = conn.execute(query, {
-                "owner": generated_owner_id, 
-                "name": provider_name,
-                "phone": provider_phone,
-                #"title": profile.get('title', 'Mystery Item'),
-                "title": item_title,
-                "bio": profile.get('bio', 'No bio provided.'),
-                "cat": profile.get('category', 'Misc'),
-                "url": image_url
+                "cid": company_id, 
+                "ind": profile.get('industry', 'Unknown'),
+                "size": profile.get('company_size', 'Unknown'),
+                "rev": profile.get('annual_revenue', 'Unknown'),
+                "reg": profile.get('region', 'Unknown'),
+                "status": profile.get('contract_status', 'Lead')
             })
-            item_id = result.fetchone()[0]
+            new_cid = result.fetchone()[0]
             conn.commit()
 
         return jsonify({
             "status": "success",
-            "item_id": str(item_id),
-            "image_url": image_url,
-            "profile": profile
+            "company_id": str(new_cid),
+            "parsed_profile": profile
         })
 
     except Exception as e:
-        print(f"Error during item listing: {traceback.format_exc()}")
-        return jsonify({
-            "error": "Operation Failed", 
-            "details": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        print(f"Error adding company: {traceback.format_exc()}")
+        return jsonify({"error": "Operation Failed", "details": str(e)}), 500
 
-
-@app.route('/api/search', methods=['GET'])
-def search():
-    """Performs semantic vector search using pgvector."""
-    if engine is None:
-        return jsonify({"error": "Database engine not initialized."}), 500
-
-    query_text = request.args.get('query') # Get the 'query' parameter from the URL
-    #data = request.json
-    #query_text = data.get('query')
-    if not query_text:
-        return jsonify([])
-
-    # Generate vector for the search query
-    '''
-    query_vector = generate_embedding(query_text)
-    if not query_vector:
-        return jsonify({"error": "Failed to generate search embedding"}), 500
-    '''
-    try:
-        with engine.connect() as conn:
-            print(f"Searching for: {query_text}") # Log the query
-
-            # Using Cosine Distance (<=>) for similarity
-            # 1 - distance = similarity score
-            search_sql = text("""
-                SELECT item_id, title, bio, category, image_url, 1 - (item_vector <=> embedding('text-embedding-005', :query)::vector) as score
-                FROM items 
-                WHERE status = 'available' AND item_vector IS NOT NULL and 
-                ai.if(
-                    prompt => 'Does this text: "' || bio ||'" match the user request: "' ||  :query || '", at least 60%? " ',
-                    model_id => 'gemini-3-flash-preview')  
-                ORDER BY item_vector <=> embedding('text-embedding-005', :query)::vector
-                LIMIT 5
-            """)
-            result = conn.execute(search_sql, {"query": query_text})
-            
-            hits = []
-            for row in result:
-                hits.append({
-                    "id": str(row[0]),
-                    "title": row[1],
-                    "bio": row[2],
-                    "category": row[3],
-                    "image_url": row[4],
-                    "score": round(float(row[5]), 3)
-                })
-            return jsonify(hits)
-    except Exception as e:
-        print(f"Error during search: {traceback.format_exc()}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/api/swipe', methods=['POST'])
-def handle_swipe():
+@app.route('/api/update-company', methods=['POST'])
+def update_company():
     """
-    Records swipe in the 'swipes' table. 
-    If right swipe, updates item status and returns provider info.
+    Allows employees to update specific B2B CRM fields (e.g., changing contract status, logging recent purchases).
+    Replaces the old interaction / swipe mechanism.
     """
     if engine is None:
         return jsonify({"error": "Database engine not initialized."}), 500
 
     data = request.json
-    direction = data.get('direction')
-    item_id = data.get('item_id')
-    # Generate a dummy swiper_id since we don't have login yet
-    swiper_id = str(uuid.uuid4()) 
+    company_id = data.get('company_id')
+    
+    # Fields that employees frequently update
+    contract_status = data.get('contract_status')
+    payment_behavior = data.get('payment_behavior')
+    last_product_1 = data.get('last_product_1')
 
-    if not item_id or direction not in ['left', 'right']:
-        return jsonify({"error": "Invalid swipe data"}), 400
+    if not company_id:
+        return jsonify({"error": "company_id is required"}), 400
 
     try:
         with engine.connect() as conn:
-            is_match = (direction == 'right')
-            
-            # 1. Record the swipe
-            swipe_query = text("""
-                INSERT INTO swipes (swiper_id, item_id, direction, is_match)
-                VALUES (:swiper, :item, :dir, :match)
+            # Dynamically update provided fields (for brevity, explicitly updating standard ones)
+            update_query = text("""
+                UPDATE companies 
+                SET contract_status = COALESCE(:status, contract_status),
+                    payment_behavior = COALESCE(:payment, payment_behavior),
+                    last_product_1 = COALESCE(:product, last_product_1)
+                WHERE company_id = :cid
+                RETURNING company_id, contract_status
             """)
-            conn.execute(swipe_query, {
-                "swiper": swiper_id,
-                "item": item_id,
-                "dir": direction,
-                "match": is_match
-            })
-
-            # 2. If it's a match, get provider info and mark item as 'matched'
-            if is_match:
-                # Fetch provider info
-                info_query = text("SELECT provider_name, provider_phone FROM items WHERE item_id = :id")
-                res = conn.execute(info_query, {"id": item_id}).fetchone()
-                
-                # Update status to remove from deck
-                update_query = text("UPDATE items SET status = 'matched' WHERE item_id = :id")
-                conn.execute(update_query, {"id": item_id})
-                
-                conn.commit()
-                
-                if res:
-                    return jsonify({
-                        "is_match": True,
-                        "provider_name": res[0],
-                        "provider_phone": res[1],
-                        "swiper_id": swiper_id
-                    })
+            res = conn.execute(update_query, {
+                "cid": company_id,
+                "status": contract_status,
+                "payment": payment_behavior,
+                "product": last_product_1
+            }).fetchone()
             
             conn.commit()
-            return jsonify({"is_match": False,
-                "swiper_id": swiper_id
+            
+            if res:
+                return jsonify({
+                    "status": "success",
+                    "company_id": res[0],
+                    "new_contract_status": res[1]
                 })
+            else:
+                return jsonify({"error": "Company not found"}), 404
 
     except Exception as e:
-        print(f"Swipe error: {traceback.format_exc()}")
-        return jsonify({
-            "error": "Database error during swipe", 
-            "details": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        print(f"Update error: {traceback.format_exc()}")
+        return jsonify({"error": "Database error during update", "details": str(e)}), 500
 
-@app.route('/api/matches', methods=['GET'])
-def get_matches():
+@app.route('/api/search', methods=['GET'])
+def search_companies():
     """
-    Returns a list of matches for a given swiper_id.  This is currently NOT USED.
+    Performs semantic vector search on the B2B CRM dataset using pgvector.
+    Allows reps to search: "large tech companies in EMEA with high revenue"
     """
     if engine is None:
         return jsonify({"error": "Database engine not initialized."}), 500
 
-    swiper_id = request.args.get('swiper_id')
-
-    if not swiper_id:
-        return jsonify({"error": "swiper_id is required"}), 400
+    query_text = request.args.get('query')
+    if not query_text:
+        return jsonify([])
 
     try:
         with engine.connect() as conn:
-            query = text("""
-                SELECT s.item_id, i.title, i.image_url, i.provider_name, i.provider_phone
-                FROM swipes s
-                JOIN items i ON s.item_id = i.item_id
-                WHERE s.swiper_id = :swiper AND s.is_match = true AND i.status = 'matched'
+            print(f"Searching companies for: {query_text}")
+
+            # Using Cosine Distance (<=>) for similarity
+            # Combining pgvector distance with pg_ai natural language filtering
+            search_sql = text("""
+                SELECT company_id, industry, company_size, annual_revenue, region,
+                       1 - (company_vector <=> embedding('text-embedding-005', :query)::vector) as score
+                FROM companies 
+                WHERE company_vector IS NOT NULL 
+                AND ai.if(
+                    prompt => 'Does this company profile: "Industry: ' || industry || ', Region: ' || region || '" logically fit the user search: "' ||  :query || '", at least 60%?',
+                    model_id => 'gemini-3-flash-preview')  
+                ORDER BY company_vector <=> embedding('text-embedding-005', :query)::vector
+                LIMIT 10
             """)
-            result = conn.execute(query, {"swiper": swiper_id})
-
-            matches = []
+            result = conn.execute(search_sql, {"query": query_text})
+            
+            hits =[]
             for row in result:
-                matches.append({
-                    "item_id": row[0],
-                    "item_title": row[1],
-                    "item_image_url": row[2],
-                    "provider_name": row[3],
-                    "provider_phone": row[4]
+                hits.append({
+                    "company_id": str(row[0]),
+                    "industry": row[1],
+                    "company_size": row[2],
+                    "annual_revenue": row[3],
+                    "region": row[4],
+                    "score": round(float(row[5]), 3)
                 })
-
-            return jsonify(matches)
-
+            return jsonify(hits)
     except Exception as e:
-        print(f"Error fetching matches: {traceback.format_exc()}")
+        print(f"Error during search: {traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
 
 
